@@ -1,7 +1,3 @@
-// AnimateCaptions.cs
-// Finds all text media events, locates the first VEGAS Picture In Picture FX,
-// and adds 3 Scale keyframes at the start.
-
 using System;
 using ScriptPortal.Vegas;
 
@@ -72,16 +68,21 @@ public class EntryPoint
                 SetKey(scale, Timecode.FromFrames(popInFramesA), maxScale);   
                 SetKey(scale, Timecode.FromFrames(popInFramesA + popInFramesB), 1);  
 
-                // Add pop-out keyframes at the end of the effect
+                // Add pop-out keyframes at the end of the effect unless another text event follows immediately
+                // or the event ends together with an audio event (clip change on audio)
                 double fps = vegas.Project.Video.FrameRate;
-                long durationFrames = (long)Math.Round(ev.Length.ToMilliseconds() / 1000.0 * fps);
-                if (durationFrames - popInFramesA - popInFramesB - popOutFramesA - popOutFramesB > fullPopOutMinFrameBuffer) {
-                    SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesA - popOutFramesB), 1);   
-                    SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), maxScale);  
-                    SetKey(scale, Timecode.FromFrames(durationFrames), minScale);  
-                } else if (durationFrames - popInFramesA - popInFramesB - popOutFramesB > halfPopOutMinFrameBuffer) {
-                    SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), 1);   
-                    SetKey(scale, Timecode.FromFrames(durationFrames), minScale);  
+                bool skipPopOut = HasImmediatelyFollowingTextEvent(vtrack, ev, fps) || EndsTogetherWithAudioEvent(vegas, ev, fps);
+                if (!skipPopOut)
+                {
+                    long durationFrames = (long)Math.Round(ev.Length.ToMilliseconds() / 1000.0 * fps);
+                    if (durationFrames - popInFramesA - popInFramesB - popOutFramesA - popOutFramesB > fullPopOutMinFrameBuffer) {
+                        SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesA - popOutFramesB), 1);   
+                        SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), maxScale);  
+                        SetKey(scale, Timecode.FromFrames(durationFrames), minScale);  
+                    } else if (durationFrames - popInFramesA - popInFramesB - popOutFramesB > halfPopOutMinFrameBuffer) {
+                        SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), 1);   
+                        SetKey(scale, Timecode.FromFrames(durationFrames), minScale);  
+                    }
                 }
             }
         }
@@ -120,5 +121,65 @@ public class EntryPoint
         // VEGAS will create or update a keyframe at 'tc' automatically.
         p.IsAnimated = true;
         p.SetValueAtTime(tc, value);
+    }
+
+    private static long ConvertTimecodeToFrames(double framesPerSecond, Timecode timecode)
+    {
+        return (long) Math.Round(timecode.ToMilliseconds() / 1000.0 * framesPerSecond);
+    }
+
+    private static bool HasImmediatelyFollowingTextEvent(VideoTrack track, VideoEvent currentEvent, double framesPerSecond)
+    {
+        long currentEndFrames = ConvertTimecodeToFrames(framesPerSecond, currentEvent.Start)
+                                + ConvertTimecodeToFrames(framesPerSecond, currentEvent.Length);
+
+        foreach (TrackEvent teNext in track.Events)
+        {
+            VideoEvent nextEvent = teNext as VideoEvent;
+            if (nextEvent == null || nextEvent == currentEvent) continue;
+
+            // Only consider generated text media events
+            Take nextTake = nextEvent.ActiveTake;
+            if (nextTake == null || nextTake.Media == null || !nextTake.Media.IsGenerated() || nextTake.Media.Generator == null)
+                continue;
+
+            string nextGenName = (nextTake.Media.Generator.PlugIn != null) ? nextTake.Media.Generator.PlugIn.Name : "";
+            if (!IsTextGenerator(nextGenName))
+                continue;
+
+            long nextStartFrames = ConvertTimecodeToFrames(framesPerSecond, nextEvent.Start);
+            if (nextStartFrames == currentEndFrames)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool EndsTogetherWithAudioEvent(Vegas vegas, VideoEvent currentEvent, double framesPerSecond)
+    {
+        long currentEndFrames = ConvertTimecodeToFrames(framesPerSecond, currentEvent.Start)
+                                + ConvertTimecodeToFrames(framesPerSecond, currentEvent.Length);
+
+        foreach (Track track in vegas.Project.Tracks)
+        {
+            AudioTrack audioTrack = track as AudioTrack;
+            if (audioTrack == null) continue;
+
+            foreach (TrackEvent te in audioTrack.Events)
+            {
+                AudioEvent otherEvent = te as AudioEvent;
+                if (otherEvent == null) continue;
+
+                long otherEndFrames = ConvertTimecodeToFrames(framesPerSecond, otherEvent.Start)
+                                      + ConvertTimecodeToFrames(framesPerSecond, otherEvent.Length);
+                if (otherEndFrames != currentEndFrames)
+                    continue;
+
+                // Any audio event ending together counts
+                return true;
+            }
+        }
+
+        return false;
     }
 }
