@@ -1,10 +1,14 @@
 using System;
+using System.Windows.Forms;
 using ScriptPortal.Vegas;
 
 public class EntryPoint
 {
-    public float minScale = 0.5f;
-    public float maxScale = 1.5f;
+    // Width estimation borrowed from ResizeToFullWidth.cs
+    private const double FullWidthCharacters = 42.0; // characters at Scale=1 that fill full width
+    private const double DefaultMaxScale = 1.2;      // 120%
+    private const double DefaultMinScale = 0.8;      // 50%
+    private const double MaxAbsExpansionFraction = 0.04; // max +10% of full width in absolute terms
     
 
     public long popInFramesA = 4;
@@ -59,13 +63,17 @@ public class EntryPoint
                 if (scale == null)
                     continue;
 
+                // Compute per-event scales
+                double minScaleValue = ComputeMinScaleForEvent(take);
+                double maxScaleValue = ComputeMaxScaleForEvent(take);
+
                 // Remove any existing Scale keyframes, then enable animation
                 scale.IsAnimated = false;
                 scale.IsAnimated = true;
                 
                 // Add pop-in keyframes at the start of the effect
-                SetKey(scale, Timecode.FromFrames(0), minScale);   
-                SetKey(scale, Timecode.FromFrames(popInFramesA), maxScale);   
+                SetKey(scale, Timecode.FromFrames(0), minScaleValue);   
+                SetKey(scale, Timecode.FromFrames(popInFramesA), maxScaleValue);   
                 SetKey(scale, Timecode.FromFrames(popInFramesA + popInFramesB), 1);  
 
                 // Add pop-out keyframes at the end of the effect unless another text event follows immediately
@@ -77,11 +85,11 @@ public class EntryPoint
                     long durationFrames = (long)Math.Round(ev.Length.ToMilliseconds() / 1000.0 * fps);
                     if (durationFrames - popInFramesA - popInFramesB - popOutFramesA - popOutFramesB > fullPopOutMinFrameBuffer) {
                         SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesA - popOutFramesB), 1);   
-                        SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), maxScale);  
-                        SetKey(scale, Timecode.FromFrames(durationFrames), minScale);  
+                        SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), maxScaleValue);  
+                        SetKey(scale, Timecode.FromFrames(durationFrames), minScaleValue);  
                     } else if (durationFrames - popInFramesA - popInFramesB - popOutFramesB > halfPopOutMinFrameBuffer) {
                         SetKey(scale, Timecode.FromFrames(durationFrames - popOutFramesB), 1);   
-                        SetKey(scale, Timecode.FromFrames(durationFrames), minScale);  
+                        SetKey(scale, Timecode.FromFrames(durationFrames), minScaleValue);  
                     }
                 }
             }
@@ -181,5 +189,114 @@ public class EntryPoint
         }
 
         return false;
+    }
+
+    // ----- Text width helpers (borrowed from ResizeToFullWidth.cs) -----
+
+    private static string GetGeneratedTextRtf(Take take)
+    {
+        try
+        {
+            if (take == null || take.Media == null || take.Media.Generator == null)
+                return null;
+
+            OFXEffect genOfx = take.Media.Generator.OFXEffect;
+            if (genOfx != null)
+            {
+                OFXStringParameter textParam = genOfx.FindParameterByName("Text") as OFXStringParameter;
+                if (textParam != null)
+                    return textParam.Value;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string RtfToPlainText(string rtf)
+    {
+        if (string.IsNullOrEmpty(rtf)) return "";
+        using (RichTextBox rbx = new RichTextBox())
+        {
+            try
+            {
+                rbx.Rtf = rtf;
+                return rbx.Text ?? "";
+            }
+            catch
+            {
+                return rtf;
+            }
+        }
+    }
+
+    private static int GetLongestLineLength(string text)
+    {
+        string normalized = (text ?? "").Replace("\r\n", "\n").Replace("\r", "\n");
+        string[] lines = normalized.Split(new[] { '\n' }, StringSplitOptions.None);
+        int longest = 0;
+        foreach (string line in lines)
+        {
+            if (line.Length > longest)
+                longest = line.Length;
+        }
+        return longest;
+    }
+
+    private static double ComputeMaxScaleForEvent(Take take)
+    {
+        // Default behavior if we cannot estimate width
+        double fallback = DefaultMaxScale;
+
+        string rtf = GetGeneratedTextRtf(take);
+        if (string.IsNullOrEmpty(rtf))
+            return fallback;
+
+        string plain = RtfToPlainText(rtf);
+        int longest = GetLongestLineLength(plain);
+        if (longest <= 0)
+            return fallback;
+
+        double baseFractionOfFullWidth = longest / FullWidthCharacters; // width at Scale=1 as fraction of full width
+        if (baseFractionOfFullWidth <= 0)
+            return fallback;
+
+        // Desired width after max scale (fraction of full width)
+        double desiredWidth = baseFractionOfFullWidth * DefaultMaxScale;
+        double maxAllowedWidth = baseFractionOfFullWidth + MaxAbsExpansionFraction; // no more than +10% of full width
+        double clampedWidth = Math.Min(desiredWidth, maxAllowedWidth);
+
+        double computedScale = clampedWidth / baseFractionOfFullWidth;
+        if (computedScale < 1.0)
+            return 1.0; // do not shrink for max
+        return computedScale;
+    }
+
+    private static double ComputeMinScaleForEvent(Take take)
+    {
+        // Default behavior if we cannot estimate width
+        double fallback = DefaultMinScale;
+
+        string rtf = GetGeneratedTextRtf(take);
+        if (string.IsNullOrEmpty(rtf))
+            return fallback;
+
+        string plain = RtfToPlainText(rtf);
+        int longest = GetLongestLineLength(plain);
+        if (longest <= 0)
+            return fallback;
+
+        double baseFractionOfFullWidth = longest / FullWidthCharacters; // width at Scale=1 as fraction of full width
+        if (baseFractionOfFullWidth <= 0)
+            return fallback;
+
+        // Desired width after min scale (fraction of full width)
+        double desiredWidth = baseFractionOfFullWidth * DefaultMinScale;
+        double minAllowedWidth = Math.Max(baseFractionOfFullWidth - MaxAbsExpansionFraction, 0.0); // no more than -10% of full width
+        double clampedWidth = Math.Max(desiredWidth, minAllowedWidth);
+
+        double computedScale = clampedWidth / baseFractionOfFullWidth;
+        if (computedScale > 1.0)
+            return 1.0; // do not grow for min
+        return computedScale;
     }
 }
