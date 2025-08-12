@@ -5,25 +5,31 @@ using ScriptPortal.Vegas;
 
 public class EntryPoint
 {
+    // Known PiP UIDs seen across versions
+    private const string PiP_UID_VEGAS = "{Svfx:com.vegascreativesoftware:pictureinpicture}";
+    private const string PiP_UID_SONY  = "{Svfx:com.sonycreativesoftware:pictureinpicture}";
+
+    // Mocha → PiP corner parameter map
+    private static readonly KeyValuePair<string, string>[] CornerMap = new KeyValuePair<string, string>[] {
+        new KeyValuePair<string,string>("surfaceTopLeft",     "CornerTL"),
+        new KeyValuePair<string,string>("surfaceTopRight",    "CornerTR"),
+        new KeyValuePair<string,string>("surfaceBottomLeft",  "CornerBL"),
+        new KeyValuePair<string,string>("surfaceBottomRight", "CornerBR"),
+    };
+
     public void FromVegas(Vegas vegas)
     {
-        // Known PiP UIDs seen across versions
-        const string PiP_UID_VEGAS = "{Svfx:com.vegascreativesoftware:pictureinpicture}";
-        const string PiP_UID_SONY  = "{Svfx:com.sonycreativesoftware:pictureinpicture}";
-
-        OFXEffect mochaSource = null; // single Mocha source across all selected events
-        VideoEvent mochaSourceEvent = null; // the event that hosts the mocha source
-        List<TargetPiP> targetPiPs = new List<TargetPiP>(); // last PiP + its event per selected event
+        List<TargetPiP> targetPiPs = new List<TargetPiP>();   // last PiP + its event per selected event
+        List<MochaSource> mochaSources = new List<MochaSource>(); // all Mocha sources across selected events
 
         int selectedCount = 0;
-        int selectedWithPiP = 0;
 
         ProgressForm progress = null;
         int totalSteps = 0;
-        int stepCounter = 0;
 
         try
         {
+            // Collect selected events, their last PiP (if any), and Mocha sources
             foreach (Track track in vegas.Project.Tracks)
             {
                 VideoTrack videoTrack = track as VideoTrack;
@@ -37,104 +43,42 @@ public class EntryPoint
                     VideoEvent videoEvent = trackEvent as VideoEvent;
                     if (videoEvent == null) continue;
 
-                    // Collect last PiP OFXEffect for this selected event (if any)
                     Effect lastPip = FindLastPiP(videoEvent, PiP_UID_VEGAS, PiP_UID_SONY);
                     if (lastPip != null && lastPip.OFXEffect != null)
                     {
                         targetPiPs.Add(new TargetPiP { Effect = lastPip.OFXEffect, Event = videoEvent });
-                        selectedWithPiP++;
                     }
 
-                    // Determine single Mocha OFXEffect source (throw if more than one selected event has Mocha)
                     OFXEffect mocha = FindMochaOFX(videoEvent);
                     if (mocha != null)
                     {
-                        if (mochaSource == null)
-                        {
-                            mochaSource = mocha;
-                            mochaSourceEvent = videoEvent;
-                        }
-                        else
-                        {
-                            throw new ApplicationException("Multiple selected events with Mocha detected. Select exactly one Mocha source event.");
-                        }
+                        mochaSources.Add(new MochaSource { Effect = mocha, Event = videoEvent });
                     }
                 }
             }
 
-            // === Copy Mocha corner pin keyframes -> all selected PiP effects ===
-            if (mochaSource == null)
+            if (mochaSources.Count == 0)
                 throw new ApplicationException("No Mocha source found among the selected events.");
 
             if (targetPiPs.Count == 0)
                 throw new ApplicationException("No Picture in Picture effects found on the selected events.");
 
-            // Determine normalization scales from the first Top Right entry (width, height in pixels)
-            double scaleX = 1.0;
-            double scaleY = 1.0;
-            try
+            // Ensure PiP is in Free Form mode
+            EnsurePiPFreeForm(targetPiPs);
+
+            double fps = vegas.Project.Video.FrameRate;
+
+            // Cache start/end frames per target for fast in-range checks
+            for (int i = 0; i < targetPiPs.Count; i++)
             {
-                var topRightParam = mochaSource.FindParameterByName("surfaceTopRight") as OFXDouble2DParameter;
-                if (topRightParam != null)
-                {
-                    OFXDouble2D wh;
-                    var keys = topRightParam.Keyframes;
-                    if (keys != null && keys.Count > 0)
-                    {
-                        // Get value at the first keyframe time
-                        var firstTime = keys[0].Time;
-                        wh = topRightParam.GetValueAtTime(firstTime);
-                    }
-                    else
-                    {
-                        // Fallback to current value
-                        wh = topRightParam.Value;
-                    }
-
-                    double widthPixels = wh.X;
-                    double heightPixels = wh.Y;
-
-                    if (widthPixels != 0.0)
-                        scaleX = 1.0 / widthPixels;
-                    if (heightPixels != 0.0)
-                        scaleY = 1.0 / heightPixels;
-                }
-            }
-            catch { }
-
-            // Ensure PiP is in Free Form mode once
-            foreach (var target in targetPiPs)
-            {
-                var modeParam = target.Effect.FindParameterByName("KeepProportions") as OFXChoiceParameter;
-                if (modeParam != null)
-                {
-                    // Choices: 0=On, 1=Fill, 2=Free Form (empirical)
-                    if (modeParam.Choices != null && modeParam.Choices.Length >= 3)
-                    {
-                        modeParam.Value = modeParam.Choices[2]; // Free Form
-                        modeParam.ParameterChanged();
-                    }
-                }
+                TargetPiP t = targetPiPs[i];
+                t.StartFrames = ConvertTimecodeToFrames(fps, t.Event.Start);
+                t.EndFrames   = ConvertTimecodeToFrames(fps, t.Event.Start + t.Event.Length);
+                targetPiPs[i] = t;
             }
 
-            var cornerMap = new System.Collections.Generic.KeyValuePair<string, string>[] {
-                new KeyValuePair<string,string>("surfaceTopLeft", "CornerTL"),
-                new KeyValuePair<string,string>("surfaceTopRight", "CornerTR"),
-                new KeyValuePair<string,string>("surfaceBottomLeft", "CornerBL"),
-                new KeyValuePair<string,string>("surfaceBottomRight", "CornerBR"),
-            };
-
-            // Pre-calc an approximate total step count for the progress bar
-            totalSteps = 0;
-            foreach (var entry in cornerMap)
-            {
-                var p = mochaSource.FindParameterByName(entry.Key) as OFXDouble2DParameter;
-                if (p != null && p.Keyframes != null)
-                {
-                    // Each keyframe potentially copied to each target (filtered by time window later)
-                    totalSteps += (p.Keyframes.Count * Math.Max(1, targetPiPs.Count));
-                }
-            }
+            // Pre-calc approximate total steps across ALL mocha sources (for progress)
+            totalSteps = EstimateTotalSteps(mochaSources, targetPiPs, CornerMap);
             if (totalSteps <= 0) totalSteps = 1;
 
             // Show the progress window
@@ -144,79 +88,13 @@ public class EntryPoint
             progress.Show();
             Application.DoEvents();
 
-            double fps = vegas.Project.Video.FrameRate;
-            long srcStartFrames = ConvertTimecodeToFrames(fps, mochaSourceEvent.Start);
-
-            // Cache start/end frames per target for fast in-range checks
-            foreach (var t in targetPiPs)
-            {
-                t.StartFrames = ConvertTimecodeToFrames(fps, t.Event.Start);
-                t.EndFrames   = ConvertTimecodeToFrames(fps, t.Event.Start + t.Event.Length);
-            }
-
-            // Copy only the keyframes that fall inside each target event's active time window.
-            int frames = 0;
-            int targetIndex = 0;
-
-            foreach (var target in targetPiPs)
-            {
-                targetIndex++;
-                progress.SetStatus("Processing event " + targetIndex + "/" + targetPiPs.Count + "…");
-
-                foreach (var entry in cornerMap)
-                {
-                    var srcParam = mochaSource.FindParameterByName(entry.Key) as OFXDouble2DParameter;
-                    if (srcParam == null)
-                        throw new ApplicationException("Mocha parameter " + entry.Key + " not found or not a 2D parameter.");
-
-                    var dstParam = target.Effect.FindParameterByName(entry.Value) as OFXDouble2DParameter;
-                    if (dstParam == null) 
-                    {
-                        // Still advance progress for src keyframes to keep bar moving consistently
-                        if (srcParam.Keyframes != null)
-                        {
-                            foreach (OFXKeyframe _ in srcParam.Keyframes)
-                                progress.Increment();
-                        }
-                        continue;
-                    }
-
-                    if (!dstParam.IsAnimated)
-                        dstParam.IsAnimated = true;
-
-                    foreach (OFXKeyframe srcKf in srcParam.Keyframes)
-                    {
-                        Timecode t = srcKf.Time;
-                        OFXDouble2D pt = srcParam.GetValueAtTime(t);
-                        long srcKeyFrames = ConvertTimecodeToFrames(fps, t);
-                        long srcKeyFramesAbs = srcKeyFrames + srcStartFrames;
-
-                        // Only write if the target event actually exists at this absolute time
-                        if (srcKeyFramesAbs >= target.StartFrames && srcKeyFramesAbs <= target.EndFrames)
-                        {
-                            // Normalize coordinates from pixels to [0,1]
-                            var ptScaled = new OFXDouble2D
-                            {
-                                X = pt.X * scaleX,
-                                Y = pt.Y * scaleY
-                            };
-
-                            long dstKeyFrames = srcKeyFramesAbs - target.StartFrames;
-                            dstParam.SetValueAtTime(Timecode.FromFrames(dstKeyFrames), ptScaled);
-                            frames++;
-                        }
-
-                        // Advance progress for each examined keyframe (applies whether copied or skipped)
-                        stepCounter++;
-                        progress.Increment();
-                    }
-                }
-            }
+            // Copy keyframes from every Mocha source to all target PiPs
+            int framesCopied = CopyMochaToPiP(mochaSources, targetPiPs, fps, progress);
 
             progress.Complete("Done");
             Application.DoEvents();
 
-            // Preserve PiP counter dialog for reference
+            // Summary
             string message;
             if (selectedCount == 0)
             {
@@ -225,8 +103,8 @@ public class EntryPoint
             else
             {
                 message = string.Format(
-                    "Selected events: {0}\n- With Picture in Picture: {1}\n- Frames copied: {2}",
-                    selectedCount, selectedWithPiP, frames);
+                    "PiP targets: {0}\nMocha sources: {1}\nFrames copied: {2}",
+                    targetPiPs.Count, mochaSources.Count, framesCopied);
             }
 
             MessageBox.Show(
@@ -252,9 +130,148 @@ public class EntryPoint
         }
     }
 
+    // === Core operations ===
+
+    private static void EnsurePiPFreeForm(List<TargetPiP> targetPiPs)
+    {
+        for (int i = 0; i < targetPiPs.Count; i++)
+        {
+            OFXEffect fx = targetPiPs[i].Effect;
+            OFXChoiceParameter modeParam = fx.FindParameterByName("KeepProportions") as OFXChoiceParameter;
+            if (modeParam == null) continue;
+
+            // Choices: 0=On, 1=Fill, 2=Free Form (empirical)
+            if (modeParam.Choices != null && modeParam.Choices.Length >= 3)
+            {
+                modeParam.Value = modeParam.Choices[2]; // Free Form
+                modeParam.ParameterChanged();
+            }
+        }
+    }
+
+    private static int EstimateTotalSteps(List<MochaSource> mochaSources, List<TargetPiP> targetPiPs, KeyValuePair<string, string>[] cornerMap)
+    {
+        int total = 0;
+        for (int i = 0; i < mochaSources.Count; i++)
+        {
+            OFXEffect srcFx = mochaSources[i].Effect;
+            for (int j = 0; j < cornerMap.Length; j++)
+            {
+                OFXDouble2DParameter p = srcFx.FindParameterByName(cornerMap[j].Key) as OFXDouble2DParameter;
+                if (p != null && p.Keyframes != null)
+                {
+                    total += (p.Keyframes.Count * Math.Max(1, targetPiPs.Count));
+                }
+            }
+        }
+        return total;
+    }
+
+    private static int CopyMochaToPiP(List<MochaSource> mochaSources, List<TargetPiP> targetPiPs, double fps, ProgressForm progress)
+    {
+        int framesCopied = 0;
+
+        int sourceIndex = 0;
+        foreach (MochaSource ms in mochaSources)
+        {
+            sourceIndex++;
+
+            // Determine normalization scales from the first Top Right entry (width, height in pixels) PER SOURCE
+            double scaleX = 1.0;
+            double scaleY = 1.0;
+            try
+            {
+                OFXDouble2DParameter topRightParam = ms.Effect.FindParameterByName("surfaceTopRight") as OFXDouble2DParameter;
+                if (topRightParam != null)
+                {
+                    OFXDouble2D wh;
+                    if (topRightParam.Keyframes != null && topRightParam.Keyframes.Count > 0)
+                    {
+                        // Get value at the first keyframe time
+                        Timecode firstTime = topRightParam.Keyframes[0].Time;
+                        wh = topRightParam.GetValueAtTime(firstTime);
+                    }
+                    else
+                    {
+                        // Fallback to current value
+                        wh = topRightParam.Value;
+                    }
+
+                    double widthPixels = wh.X;
+                    double heightPixels = wh.Y;
+
+                    if (widthPixels != 0.0) scaleX = 1.0 / widthPixels;
+                    if (heightPixels != 0.0) scaleY = 1.0 / heightPixels;
+                }
+            }
+            catch { }
+
+            long srcStartFrames = ConvertTimecodeToFrames(fps, ms.Event.Start);
+
+            int targetIndex = 0;
+            foreach (TargetPiP target in targetPiPs)
+            {
+                targetIndex++;
+                progress.SetStatus("Processing source " + sourceIndex + "/" + mochaSources.Count + " • event " + targetIndex + "/" + targetPiPs.Count + "…");
+
+                for (int k = 0; k < CornerMap.Length; k++)
+                {
+                    KeyValuePair<string, string> map = CornerMap[k];
+
+                    OFXDouble2DParameter srcParam = ms.Effect.FindParameterByName(map.Key) as OFXDouble2DParameter;
+                    if (srcParam == null)
+                        throw new ApplicationException("Mocha parameter " + map.Key + " not found or not a 2D parameter.");
+
+                    OFXDouble2DParameter dstParam = target.Effect.FindParameterByName(map.Value) as OFXDouble2DParameter;
+                    if (dstParam == null)
+                    {
+                        // Still advance progress for src keyframes to keep bar moving consistently
+                        if (srcParam.Keyframes != null)
+                        {
+                            foreach (OFXKeyframe _ in srcParam.Keyframes)
+                                progress.Increment();
+                        }
+                        continue;
+                    }
+
+                    if (!dstParam.IsAnimated)
+                        dstParam.IsAnimated = true;
+
+                    foreach (OFXKeyframe srcKf in srcParam.Keyframes)
+                    {
+                        Timecode t = srcKf.Time;
+                        OFXDouble2D pt = srcParam.GetValueAtTime(t);
+                        long srcKeyFrames = ConvertTimecodeToFrames(fps, t);
+                        long srcKeyFramesAbs = srcKeyFrames + srcStartFrames;
+
+                        // Only write if the target event actually exists at this absolute time
+                        if (srcKeyFramesAbs >= target.StartFrames && srcKeyFramesAbs <= target.EndFrames)
+                        {
+                            // Normalize coordinates from pixels to [0,1]
+                            OFXDouble2D ptScaled = new OFXDouble2D();
+                            ptScaled.X = pt.X * scaleX;
+                            ptScaled.Y = pt.Y * scaleY;
+
+                            long dstKeyFrames = srcKeyFramesAbs - target.StartFrames;
+                            dstParam.SetValueAtTime(Timecode.FromFrames(dstKeyFrames), ptScaled);
+                            framesCopied++;
+                        }
+
+                        // Advance progress for each examined keyframe (applies whether copied or skipped)
+                        progress.Increment();
+                    }
+                }
+            }
+        }
+
+        return framesCopied;
+    }
+
+    // === Helpers & data containers ===
+
     private static long ConvertTimecodeToFrames(double framesPerSecond, Timecode timecode)
     {
-        return (long) Math.Round(timecode.ToMilliseconds() / 1000.0 * framesPerSecond);
+        return (long)Math.Round(timecode.ToMilliseconds() / 1000.0 * framesPerSecond);
     }
 
     private class TargetPiP
@@ -263,6 +280,12 @@ public class EntryPoint
         public VideoEvent Event;
         public long StartFrames;
         public long EndFrames;
+    }
+
+    private class MochaSource
+    {
+        public OFXEffect Effect;
+        public VideoEvent Event;
     }
 
     private static Effect FindLastPiP(VideoEvent videoEvent, params string[] knownUids)
