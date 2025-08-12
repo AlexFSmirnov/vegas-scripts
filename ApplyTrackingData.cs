@@ -12,7 +12,8 @@ public class EntryPoint
         const string PiP_UID_SONY  = "{Svfx:com.sonycreativesoftware:pictureinpicture}";
 
         OFXEffect mochaSource = null; // single Mocha source across all selected events
-        List<OFXEffect> lastPipEffects = new List<OFXEffect>(); // last PiP per selected event
+        VideoEvent mochaSourceEvent = null; // the event that hosts the mocha source
+        List<TargetPiP> targetPiPs = new List<TargetPiP>(); // last PiP + its event per selected event
 
         int selectedCount = 0;
         int selectedWithPiP = 0;
@@ -34,7 +35,7 @@ public class EntryPoint
                 Effect lastPip = FindLastPiP(videoEvent, PiP_UID_VEGAS, PiP_UID_SONY);
                 if (lastPip != null && lastPip.OFXEffect != null)
                 {
-                    lastPipEffects.Add(lastPip.OFXEffect);
+                    targetPiPs.Add(new TargetPiP { Effect = lastPip.OFXEffect, Event = videoEvent });
                     selectedWithPiP++;
                 }
 
@@ -45,6 +46,7 @@ public class EntryPoint
                     if (mochaSource == null)
                     {
                         mochaSource = mocha;
+                        mochaSourceEvent = videoEvent;
                     }
                     else
                     {
@@ -58,17 +60,12 @@ public class EntryPoint
         if (mochaSource == null)
             throw new ApplicationException("No Mocha source found among the selected events.");
 
-        if (lastPipEffects.Count == 0)
+        if (targetPiPs.Count == 0)
             throw new ApplicationException("No Picture in Picture effects found on the selected events.");
         
-        var cornerMap = new System.Collections.Generic.KeyValuePair<string, string>[] {
-            new KeyValuePair<string,string>("surfaceTopLeft", "CornerTL"),
-            new KeyValuePair<string,string>("surfaceTopRight", "CornerTR"),
-            new KeyValuePair<string,string>("surfaceBottomLeft", "CornerBL"),
-            new KeyValuePair<string,string>("surfaceBottomRight", "CornerBR"),
-        };
-        
         int frames = 0;
+        double fps = vegas.Project.Video.FrameRate;
+        long srcStartFrames = ConvertTimecodeToFrames(fps, mochaSourceEvent.Start);
 
         // Determine normalization scales from the first Top Right entry (width, height in pixels)
         double scaleX = 1.0;
@@ -102,6 +99,23 @@ public class EntryPoint
             }
         }
         catch { }
+        
+        foreach (var target in targetPiPs)
+        {
+            var modeParam = target.Effect.FindParameterByName("KeepProportions") as OFXChoiceParameter;
+            if (modeParam != null)
+            {
+                modeParam.Value = modeParam.Choices[2]; // Free Form
+                modeParam.ParameterChanged();
+            }
+        }
+        
+        var cornerMap = new System.Collections.Generic.KeyValuePair<string, string>[] {
+            new KeyValuePair<string,string>("surfaceTopLeft", "CornerTL"),
+            new KeyValuePair<string,string>("surfaceTopRight", "CornerTR"),
+            new KeyValuePair<string,string>("surfaceBottomLeft", "CornerBL"),
+            new KeyValuePair<string,string>("surfaceBottomRight", "CornerBR"),
+        };
 
         foreach (var entry in cornerMap)
         {
@@ -113,10 +127,11 @@ public class EntryPoint
             {
                 Timecode t = srcKf.Time;
                 OFXDouble2D pt = srcParam.GetValueAtTime(t);
+                long srcKeyFrames = ConvertTimecodeToFrames(fps, t);
 
-                foreach (var pip in lastPipEffects)
+                foreach (var target in targetPiPs)
                 {
-                    var dstParam = pip.FindParameterByName(entry.Value) as OFXDouble2DParameter;
+                    var dstParam = target.Effect.FindParameterByName(entry.Value) as OFXDouble2DParameter;
                     if (dstParam == null) continue;
 
                     if (!dstParam.IsAnimated)
@@ -127,7 +142,13 @@ public class EntryPoint
                     ptScaled.X = pt.X * scaleX;
                     ptScaled.Y = pt.Y * scaleY;
 
-                    dstParam.SetValueAtTime(t, ptScaled);
+                    long dstStartFrames = ConvertTimecodeToFrames(fps, target.Event.Start);
+                    long offsetFrames = srcStartFrames - dstStartFrames;
+                    long dstFrames = srcKeyFrames + offsetFrames;
+                    if (dstFrames < 0)
+                        continue; // skip negative local times
+
+                    dstParam.SetValueAtTime(Timecode.FromFrames(dstFrames), ptScaled);
                     frames++;
                 }
             }
@@ -151,6 +172,17 @@ public class EntryPoint
             "Selected FX Counts",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
+    }
+    
+    private static long ConvertTimecodeToFrames(double framesPerSecond, Timecode timecode)
+    {
+        return (long) Math.Round(timecode.ToMilliseconds() / 1000.0 * framesPerSecond);
+    }
+    
+    private class TargetPiP
+    {
+        public OFXEffect Effect;
+        public VideoEvent Event;
     }
     
     private static Effect FindLastPiP(VideoEvent videoEvent, params string[] knownUids)
