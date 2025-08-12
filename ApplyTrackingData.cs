@@ -77,6 +77,18 @@ public class EntryPoint
                 targetPiPs[i] = t;
             }
 
+            // Read project resolution once
+            double projectWidth = 0.0, projectHeight = 0.0;
+            try
+            {
+                if (vegas.Project.Video != null)
+                {
+                    projectWidth  = (double)vegas.Project.Video.Width;
+                    projectHeight = (double)vegas.Project.Video.Height;
+                }
+            }
+            catch { /* ignore */ }
+
             // Pre-calc approximate total steps across ALL mocha sources (for progress)
             totalSteps = EstimateTotalSteps(mochaSources, targetPiPs, CornerMap);
             if (totalSteps <= 0) totalSteps = 1;
@@ -89,7 +101,7 @@ public class EntryPoint
             Application.DoEvents();
 
             // Copy keyframes from every Mocha source to all target PiPs
-            int framesCopied = CopyMochaToPiP(mochaSources, targetPiPs, fps, progress);
+            int framesCopied = CopyMochaToPiP(mochaSources, targetPiPs, fps, progress, projectWidth, projectHeight);
 
             progress.Complete("Done");
             Application.DoEvents();
@@ -167,7 +179,13 @@ public class EntryPoint
         return total;
     }
 
-    private static int CopyMochaToPiP(List<MochaSource> mochaSources, List<TargetPiP> targetPiPs, double fps, ProgressForm progress)
+    private static int CopyMochaToPiP(
+        List<MochaSource> mochaSources,
+        List<TargetPiP> targetPiPs,
+        double fps,
+        ProgressForm progress,
+        double projectWidth,
+        double projectHeight)
     {
         int framesCopied = 0;
 
@@ -176,35 +194,43 @@ public class EntryPoint
         {
             sourceIndex++;
 
-            // Determine normalization scales from the first Top Right entry (width, height in pixels) PER SOURCE
+            // Determine normalization scales per SOURCE using PROJECT resolution only.
+            // If project resolution is unavailable, fall back to old Mocha 'surfaceTopRight' width/height.
             double scaleX = 1.0;
             double scaleY = 1.0;
-            try
+
+            if (projectWidth > 0)  scaleX = 1.0 / projectWidth;
+            if (projectHeight > 0) scaleY = 1.0 / projectHeight;
+
+            if (projectWidth <= 0 || projectHeight <= 0)
             {
-                OFXDouble2DParameter topRightParam = ms.Effect.FindParameterByName("surfaceTopRight") as OFXDouble2DParameter;
-                if (topRightParam != null)
+                try
                 {
-                    OFXDouble2D wh;
-                    if (topRightParam.Keyframes != null && topRightParam.Keyframes.Count > 0)
+                    OFXDouble2DParameter topRightParam = ms.Effect.FindParameterByName("surfaceTopRight") as OFXDouble2DParameter;
+                    if (topRightParam != null)
                     {
-                        // Get value at the first keyframe time
-                        Timecode firstTime = topRightParam.Keyframes[0].Time;
-                        wh = topRightParam.GetValueAtTime(firstTime);
-                    }
-                    else
-                    {
-                        // Fallback to current value
-                        wh = topRightParam.Value;
-                    }
+                        OFXDouble2D wh;
+                        if (topRightParam.Keyframes != null && topRightParam.Keyframes.Count > 0)
+                        {
+                            // Get value at the first keyframe time
+                            Timecode firstTime = topRightParam.Keyframes[0].Time;
+                            wh = topRightParam.GetValueAtTime(firstTime);
+                        }
+                        else
+                        {
+                            // Fallback to current value
+                            wh = topRightParam.Value;
+                        }
 
-                    double widthPixels = wh.X;
-                    double heightPixels = wh.Y;
+                        double widthPixels = wh.X;
+                        double heightPixels = wh.Y;
 
-                    if (widthPixels != 0.0) scaleX = 1.0 / widthPixels;
-                    if (heightPixels != 0.0) scaleY = 1.0 / heightPixels;
+                        if (widthPixels != 0.0) scaleX = 1.0 / widthPixels;
+                        if (heightPixels != 0.0) scaleY = 1.0 / heightPixels;
+                    }
                 }
+                catch { /* ignore */ }
             }
-            catch { }
 
             long srcStartFrames = ConvertTimecodeToFrames(fps, ms.Event.Start);
 
@@ -247,7 +273,7 @@ public class EntryPoint
                         // Only write if the target event actually exists at this absolute time
                         if (srcKeyFramesAbs >= target.StartFrames && srcKeyFramesAbs <= target.EndFrames)
                         {
-                            // Normalize coordinates from pixels to [0,1]
+                            // Normalize coordinates from pixels to [0,1] using project resolution
                             OFXDouble2D ptScaled = new OFXDouble2D();
                             ptScaled.X = pt.X * scaleX;
                             ptScaled.Y = pt.Y * scaleY;
