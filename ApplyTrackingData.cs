@@ -43,7 +43,7 @@ public class EntryPoint
                     VideoEvent videoEvent = trackEvent as VideoEvent;
                     if (videoEvent == null) continue;
 
-                    Effect lastPip = FindLastPiP(videoEvent, PiP_UID_VEGAS, PiP_UID_SONY);
+                    Effect lastPip = FindLastPiPAfterMocha(videoEvent, PiP_UID_VEGAS, PiP_UID_SONY);
                     if (lastPip != null && lastPip.OFXEffect != null)
                     {
                         targetPiPs.Add(new TargetPiP { Effect = lastPip.OFXEffect, Event = videoEvent });
@@ -325,6 +325,50 @@ public class EntryPoint
             }
         }
         return last;
+    }
+
+    private static Effect FindLastPiPAfterMocha(VideoEvent videoEvent, params string[] knownUids)
+    {
+        Effect lastPip = null;
+        int lastMochaIndex = -1;
+        
+        // First pass: find the index of the last Mocha effect
+        for (int i = 0; i < videoEvent.Effects.Count; i++)
+        {
+            Effect effect = videoEvent.Effects[i];
+            if (IsMochaEffect(effect))
+            {
+                lastMochaIndex = i;
+            }
+        }
+        
+        // Second pass: find the last PiP effect that comes after the last Mocha effect
+        for (int i = 0; i < videoEvent.Effects.Count; i++)
+        {
+            Effect effect = videoEvent.Effects[i];
+            if (IsPiPEffect(effect, knownUids))
+            {
+                // Only include this PiP if it comes after the last Mocha effect
+                // or if there is no Mocha effect
+                if (lastMochaIndex == -1 || i > lastMochaIndex)
+                {
+                    lastPip = effect;
+                }
+            }
+        }
+        
+        return lastPip;
+    }
+
+    private static bool IsMochaEffect(Effect effect)
+    {
+        if (effect == null || !effect.IsOFX || effect.PlugIn == null) return false;
+
+        string uid = effect.PlugIn.UniqueID ?? string.Empty;
+        string name = effect.PlugIn.Name ?? string.Empty;
+
+        return uid.IndexOf("mocha", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               name.IndexOf("Mocha", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static bool IsPiPEffect(Effect effect, params string[] knownUids)
