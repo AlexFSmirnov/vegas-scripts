@@ -30,8 +30,8 @@ public class EntryPoint
                 if (!IsTextGenerator(genName))
                     continue;
 
-                // Find first Picture in Picture effect on this event
-                Effect pip = FindFirstPiP(ev, PiP_UID);
+                // Find last Picture in Picture effect with Fixed Shape mode on this event
+                Effect pip = FindLastPiPWithFixedShape(ev, PiP_UID);
                 if (pip == null)
                     continue;
 
@@ -61,8 +61,10 @@ public class EntryPoint
             || name.IndexOf("Text", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
-    private static Effect FindFirstPiP(VideoEvent ev, string uid)
+    private static Effect FindLastPiPWithFixedShape(VideoEvent ev, string uid)
     {
+        Effect lastFixedShapePiP = null;
+        
         foreach (Effect fx in ev.Effects)
         {
             if (!fx.IsOFX) continue;
@@ -73,9 +75,30 @@ public class EntryPoint
                              fx.PlugIn.Name.IndexOf("Picture in Picture", StringComparison.OrdinalIgnoreCase) >= 0;
 
             if (uidMatch || nameMatch)
-                return fx;
+            {
+                // Check if this PiP has Fixed Shape mode (choice index 1)
+                if (IsPiPInFixedShapeMode(fx))
+                {
+                    lastFixedShapePiP = fx;
+                }
+            }
         }
-        return null;
+        return lastFixedShapePiP;
+    }
+
+    private static bool IsPiPInFixedShapeMode(Effect fx)
+    {
+        if (fx == null || !fx.IsOFX || fx.OFXEffect == null)
+            return false;
+
+        OFXChoiceParameter modeParam = fx.OFXEffect.FindParameterByName("KeepProportions") as OFXChoiceParameter;
+        if (modeParam == null || modeParam.Choices == null)
+            return false;
+
+        // Choice index 0 should be "Fixed Shape" mode
+        return modeParam.Value != null && 
+               modeParam.Choices.Length > 1 && 
+               modeParam.Value.Index == 0;
     }
 
     private static void SetKey(OFXDoubleParameter p, Timecode tc, double value)
